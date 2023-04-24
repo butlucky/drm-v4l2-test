@@ -1,0 +1,46 @@
+1 Application.mk
+
+APP_ABI       := armeabi-v7a arm64-v8a
+APP_PLATFORM  := android-31
+APP_STL       := c++_static
+APP_STRIP_MODE := none
+
+2 Android.mk
+
+LOCAL_PATH      := $(call my-dir)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE    := rockit.byted
+LOCAL_SRC_FILES := $(LIB_ARCH)/librockit.byted.so
+LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)/../../sdk/rk3588/include
+include $(PREBUILT_SHARED_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE           := libbyte_capture
+LOCAL_SRC_FILES        := worker.cpp \
+						  byted_lark_utils.cpp \
+						  video_capture.cpp
+LOCAL_CFLAGS           += -Wno-extern-c-compat -std=c++17
+LOCAL_C_INCLUDES       := $(LOCAL_PATH)/..
+LOCAL_SHARED_LIBRARIES += librockit.byted \
+                          libmpp.byted \
+                          libffmpeg_58.byted \
+                          libgraphic_lsf.byted
+include $(BUILD_STATIC_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE           := byted_lark_v4l2_capture
+LOCAL_SRC_FILES        := v4l2_capture.cpp
+LOCAL_CFLAGS           += -Wno-extern-c-compat
+LOCAL_CPPFLAGS         += -std=c++17 -DOS_ANDROID -DV4L2_BUILD_DAEMO
+LOCAL_LDLIBS     	   += -llog -lmediandk -landroid -lEGL -lGLESv2 -lGLESv1_CM -lvulkan
+LOCAL_C_INCLUDES       := $(RENDER_DEPS_INCLUDES) \
+                          $(RENDER_DEPS_INCLUDE_PATH)/frameworks/native/libs/nativebase/include/
+LOCAL_STATIC_LIBRARIES += libbyte_render
+LOCAL_SHARED_LIBRARIES += libutils \
+                          libui \
+                          libbinder \
+                          libgui \
+                          libbase
+include $(BUILD_EXECUTABLE)
+
