@@ -23,22 +23,45 @@
 #include <poll.h>
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
-#include "v4l2/videodev2.h"
-#ifdef V4L2_BUILD_DAEMO
-#include "../video_render/render/VideoRenderer.h"
-#include "../common/video_frame/VideoFrame.h"
-static std::shared_ptr<byteview::VideoRenderer> v4l2_videoRenderer;
-#endif
+#include <pthread.h>
+#include <sys/system_properties.h>
+#include <linux/videodev2.h>
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 #define FMT_NUM_PLANES 1
-
 #define BUFFER_COUNT 6
+#define HASH_TABLE_NUM 128
 #define CAPTURE_RAW_PATH "/data"
 #define DEFAULT_CAPTURE_RAW_PATH "/data/capture_image"
 #define CAPTURE_CNT_FILENAME ".capture_cnt"
-#define DBG(...) do { if(!silent) { printf("[%s-%d]--> ",__func__,__LINE__); printf(__VA_ARGS__);} } while(0)
-#define ERR(...) do { printf("[%s-%d]--> ",__func__,__LINE__); printf(__VA_ARGS__); } while (0)
+
+enum Cam_Ctrl {
+    /* view mode settings */
+    CAM_MODE_DEFAULT,
+    CAM_MODE_SOFT,
+    CAM_MODE_STANDARD,
+    CAM_MODE_CLEAR,
+    CAM_MODE_BRIGHT,
+    CAM_MODE_COMPUTER,
+    CAM_MODE_CLEAR_LED,
+    CAM_MODE_FACIAL_FEATURES,
+
+    /* ptz control */
+    CAM_CTRL_PAN_LEFT,
+    CAM_CTRL_PAN_RIGHT,
+    CAM_CTRL_TILT_UP,
+    CAM_CTRL_TILT_DOWN,
+    CAM_CTRL_ZOOM_IN,
+    CAM_CTRL_ZOOM_OUT,
+};
+
+typedef struct node {
+    int key;
+    int min;
+    int max;
+    int range;
+    struct node *next;
+} vidctl_node;
 
 typedef struct v4l2_context {
     char out_file[255];
@@ -65,6 +88,10 @@ typedef struct v4l2_context {
     int limit_range;
     int outputCnt;
     int skipCnt;
+    struct video_fmts *v_infos;
+    unsigned int nv_infos;
+    int pipe;
+    vidctl_node *vidctl[HASH_TABLE_NUM];
 
     char yuv_dir_path[64];
     int _is_yuv_dir_exist;
@@ -79,16 +106,27 @@ struct buffer {
     int handle;
     int sequence;
 };
-static int silent,rate_print;
+
+struct video_fmts {
+	int pixelformat;
+	int fmt_type;
+	int fmt_cnts;
+	void *fmt_info;
+};
+
+static int silent;
 static v4l2_context_t *g_main_ctx = NULL;
 static const char *dev_drm = "/dev/dri/card0";
-#ifdef V4L2_BUILD_DAEMO
-static void init_render(v4l2_context_t *ctx);
-#endif
+static const char *p_fifo = "/mnt/.fifobyted";
+pthread_t camera_control;
+void *camera_thread(void *arg);
+
+#define DBG(...) do { if(!silent) { printf("[%s-%d]--> ",__func__,__LINE__); printf(__VA_ARGS__);} } while(0)
+#define ERR(...) do { printf("[%s-%d]--> ",__func__,__LINE__); printf(__VA_ARGS__); } while (0)
 
 static void errno_exit(v4l2_context_t *ctx, const char *s)
 {
-    printf("%s: %s error %d, %s\n", ctx->dev_name, s, errno, strerror(errno));
+    ERR("%s: %s error %d, %s\n", ctx->dev_name, s, errno, strerror(errno));
     if(!ctx->vop)
         exit(-1);
 }
@@ -303,7 +341,7 @@ static int get_value_from_file(const char* path, int* value, int* frameId)
     char buffer[16] = {0};
     int fp;
 
-    fp = open(path, O_RDONLY | O_SYNC);
+    fp = open(path, O_RDONLY | O_SYNC | O_CLOEXEC);
     if (fp) {
         if (read(fp, buffer, sizeof(buffer)) > 0) {
             char *p = NULL;
@@ -388,8 +426,7 @@ static int creat_yuv_dir(const char* path, v4l2_context_t *ctx)
 static void process_image(const void *p, int sequence, int size, v4l2_context_t *ctx)
 {
     if (ctx->fp && sequence >= ctx->skipCnt && ctx->outputCnt-- > 0) {
-        if(rate_print)
-            DBG("frame : <%d> \n",sequence+1);
+        DBG("frame : <%d> \n",sequence+1);
         fwrite(p, size, 1, ctx->fp);
         fflush(ctx->fp);
     } else if (ctx->writeFileSync) {
@@ -462,45 +499,22 @@ static int v4l2_read_frame(v4l2_context_t *ctx)
     else
         bytesused = buf.bytesused;
 
-#ifdef V4L2_BUILD_DAEMO
-    rate_print = 1;
-#else
-    rate_print = 0;
-    if(buf.sequence%180 == 0)
-        rate_print = 1;
-#endif
-
     if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == ctx->buf_type) {
-        if (rate_print)
-            DBG("%s: fd-[%d] -> v4l2_plane [bytesused %d, length %d,"
-              "mem_offset %d,data_offset %d], frame [%d]\n",
-              ctx->dev_name, export_fd, buf.m.planes[0].bytesused, buf.m.planes[0].length,
-              buf.m.planes[0].m.mem_offset, buf.m.planes[0].data_offset,buf.sequence);
+        DBG("%s: fd-[%d] -> v4l2_plane [bytesused %d, length %d,"
+            "mem_offset %d,data_offset %d], frame [%d]\n",
+            ctx->dev_name, export_fd, buf.m.planes[0].bytesused, buf.m.planes[0].length,
+            buf.m.planes[0].m.mem_offset, buf.m.planes[0].data_offset,buf.sequence);
     }else{
-        if(rate_print)
-            DBG("%s: fd-[%d] -> v4l2_buffer [type: %d, bytesused %d, mem_offset %d, length %d] \n ",
-              ctx->dev_name, export_fd, buf.type, buf.bytesused, buf.m.offset, buf.length);
+        DBG("%s: fd-[%d] -> v4l2_buffer [type: %d, bytesused %d, mem_offset %d, length %d] \n ",
+            ctx->dev_name, export_fd, buf.type, buf.bytesused, buf.m.offset, buf.length);
     }
 
     if(ctx->vop == 1 && !ctx->writeFileSync){
-#ifdef V4L2_BUILD_DAEMO
-        std::shared_ptr<byteview::VideoFrame> videoFrame = std::make_shared<byteview::VideoFrame>(
-            (int)ctx->width, (int)ctx->height, ctx->stride_x, ctx->stride_y,
-            byteview::FrameType::kNv12_OESFD, "0");
-
-        videoFrame->setFd(export_fd);
-        v4l2_videoRenderer->updateFrame(videoFrame);
-
-        videoFrame->setReleaseFunction([v4l2_fd,export_fd,v4l2_buf]
-            {
-                DBG("release frame fd:%d \n", export_fd);
-                if (-1 == xioctl(v4l2_fd, VIDIOC_QBUF, v4l2_buf))
-                    ERR("videoFrame QBUF error %d, %s\n", errno, strerror(errno));
-            }
-        );
-#else
-        ret = i;
-#endif
+        DBG("release frame fd:%d \n", export_fd);
+        if (-1 == xioctl(v4l2_fd, VIDIOC_QBUF, v4l2_buf)){
+            ret = -1;
+            errno_exit(ctx, "VIDIOC_QBUF");
+        }
     }
 
     if(ctx->writeFile || ctx->writeFileSync){
@@ -512,7 +526,14 @@ static int v4l2_read_frame(v4l2_context_t *ctx)
             }
         }
     }
- 
+
+    if(!ctx->vop && !ctx->writeFile && !ctx->writeFileSync){
+        if (-1 == xioctl(v4l2_fd, VIDIOC_QBUF, v4l2_buf)){
+            ret = -1;
+            errno_exit(ctx, "VIDIOC_QBUF");
+        }
+    }
+
     return ret;
 }
 
@@ -538,8 +559,7 @@ int v4l2_release_frame(v4l2_context *ctx, int index)
         return -1;
     }
 
-    if(rate_print)
-        DBG("%s: release frame fd:%d \n",ctx->dev_name, ctx->buffers[index].export_fd);
+    DBG("%s: release frame fd:%d \n",ctx->dev_name, ctx->buffers[index].export_fd);
 
     return 0;
 }
@@ -550,6 +570,458 @@ static void mainloop(v4l2_context_t *ctx)
 
     while ((ctx->frame_count == -1) || (ctx->frame_count-- > 0))
        v4l2_read_frame(ctx);
+}
+
+static int v4l2_check_fmt(v4l2_context_t *ctx)
+{
+    struct v4l2_format fmt;
+    int i = 0, j = 0;
+    int w = 0, h = 0;
+    int found = -1;
+
+    for(i = 0; i < ctx->nv_infos; i++){
+        if(ctx->format == ctx->v_infos[i].pixelformat){
+            found = 0;
+            if(ctx->v_infos[i].fmt_type == V4L2_FRMSIZE_TYPE_DISCRETE){
+                for(j=0; j < ctx->v_infos[i].fmt_cnts; j++) {
+                    w = ((struct v4l2_frmsize_discrete *)ctx->v_infos[i].fmt_info)[j].width;
+                    h = ((struct v4l2_frmsize_discrete *)ctx->v_infos[i].fmt_info)[j].height;
+                    if(w == ctx->width && h == ctx->height){
+                        found = 1;
+                        break;
+                    }
+                }
+            }else if(ctx->v_infos[i].fmt_type == V4L2_FRMSIZE_TYPE_STEPWISE){
+                int ws,hs,w_c,h_c,w_y,h_y;
+                w = ((struct v4l2_frmsize_stepwise *)ctx->v_infos[i].fmt_info)[j].min_width;
+                ws = ((struct v4l2_frmsize_stepwise *)ctx->v_infos[i].fmt_info)[j].max_width;
+                h = ((struct v4l2_frmsize_stepwise *)ctx->v_infos[i].fmt_info)[j].min_height;
+                hs = ((struct v4l2_frmsize_stepwise *)ctx->v_infos[i].fmt_info)[j].max_height;
+                w_y = ctx->width%16;
+                h_y = ctx->height%9;
+                if(w_y == 0 && h_y == 0 &&
+                    ctx->width > w && ctx->width < ws &&
+                    ctx->height > h && ctx->height < hs){
+                    found = 1;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    fmt.type = ctx->buf_type;
+    if(ctx->buf_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE){
+        fmt.fmt.pix_mp.width  = ctx->width;
+        fmt.fmt.pix_mp.height = ctx->height;
+        fmt.fmt.pix_mp.pixelformat = ctx->format;
+        fmt.fmt.pix_mp.num_planes = 1;
+    }else if(ctx->buf_type == V4L2_BUF_TYPE_VIDEO_CAPTURE){
+        fmt.fmt.pix.width  = ctx->width;
+        fmt.fmt.pix.height = ctx->height;
+        fmt.fmt.pix.pixelformat = ctx->format;
+    }
+    if (ioctl(ctx->fd, VIDIOC_TRY_FMT, &fmt) == -1){
+        errno_exit(ctx,"VIDIOC_TYR_FMT");
+        found = -1;
+    }
+
+    if(found == -1)
+        DBG("[Error]: the pixel format[0x%x] is not supported by camera!\n",ctx->format);
+    else if(found == 0)
+        DBG("[Warning]: the width&height setting is not standard config for camera!\n");
+    else if(found == 1)
+        DBG("[%s]: current setting is suitale for camera!\n",__FUNCTION__);
+
+    return found;
+}
+
+static int v4l2_enum_fmt(v4l2_context_t *ctx)
+{
+    struct v4l2_capability cap;
+    struct v4l2_fmtdesc fmtdesc;
+    struct v4l2_frmsizeenum frmsize;
+    struct v4l2_format fmt;
+    int ret = 0;
+    int i = 0, j = 0;
+
+    CLEAR(fmtdesc);
+    CLEAR(fmt);
+    if (-1 == xioctl(ctx->fd, VIDIOC_QUERYCAP, &cap)) {
+        if (EINVAL == errno) {
+            ERR("%s: %s is no V4L2 device\n", ctx->dev_name,
+                ctx->dev_name);
+        } else {
+            errno_exit(ctx, "VIDIOC_QUERYCAP");
+        }
+    }
+    DBG("v4l2 capabilities 0x%x\n",cap.capabilities);
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) &&
+            !(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE)) {
+        ERR("%s: is not a video capture device, capabilities: %x\n",
+            ctx->dev_name, cap.capabilities);
+    }
+    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
+        ERR("%s: %s does not support streaming i/o\n", ctx->dev_name,
+            ctx->dev_name);
+    }
+    if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)
+        ctx->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    else if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE)
+        ctx->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+
+    fmtdesc.index = 0;
+    fmtdesc.type = ctx->buf_type;
+    while (ioctl(ctx->fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
+        ctx->nv_infos = fmtdesc.index+1;
+        ctx->v_infos = (struct video_fmts *)realloc(ctx->v_infos, ctx->nv_infos*sizeof(struct video_fmts));
+        ctx->v_infos[fmtdesc.index].pixelformat = fmtdesc.pixelformat;
+
+        CLEAR(frmsize);
+        frmsize.pixel_format = fmtdesc.pixelformat;
+        frmsize.index = 0;
+        while (ioctl(ctx->fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0) {
+            ctx->v_infos[fmtdesc.index].fmt_cnts = frmsize.index+1;
+            ctx->v_infos[fmtdesc.index].fmt_type = frmsize.type;
+            if(frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE){
+                ctx->v_infos[fmtdesc.index].fmt_info =
+                    (struct v4l2_frmsize_discrete *)realloc(ctx->v_infos[fmtdesc.index].fmt_info,
+                        ctx->v_infos[fmtdesc.index].fmt_cnts*sizeof(struct v4l2_frmsize_discrete));
+                    ((struct v4l2_frmsize_discrete *)ctx->v_infos[fmtdesc.index].fmt_info)[frmsize.index].width  =
+                        frmsize.discrete.width;
+                    ((struct v4l2_frmsize_discrete *)ctx->v_infos[fmtdesc.index].fmt_info)[frmsize.index].height =
+                        frmsize.discrete.height;
+            }else if(frmsize.type == V4L2_FRMSIZE_TYPE_STEPWISE){
+                ctx->v_infos[fmtdesc.index].fmt_info =
+                    (struct v4l2_frmsize_stepwise *)realloc(ctx->v_infos[fmtdesc.index].fmt_info,
+                        ctx->v_infos[fmtdesc.index].fmt_cnts*sizeof(struct v4l2_frmsize_stepwise));
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[fmtdesc.index].fmt_info)[frmsize.index].min_width  =
+                        frmsize.stepwise.min_width;
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[fmtdesc.index].fmt_info)[frmsize.index].max_width  =
+                        frmsize.stepwise.max_width;
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[fmtdesc.index].fmt_info)[frmsize.index].min_height =
+                        frmsize.stepwise.min_height;
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[fmtdesc.index].fmt_info)[frmsize.index].max_height =
+                        frmsize.stepwise.max_height;
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[fmtdesc.index].fmt_info)[frmsize.index].step_width =
+                        frmsize.stepwise.step_width;
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[fmtdesc.index].fmt_info)[frmsize.index].step_height =
+                        frmsize.stepwise.step_height;
+            }else{
+                DBG("frmsize type: V4L2_FRMSIZE_TYPE_CONTINUOUS\n");
+            }
+            frmsize.index++;
+        }
+        fmtdesc.index++;
+    }
+
+    for(i=0;i<ctx->nv_infos;i++){
+        DBG("pixfmt 0x%x , fmt_cnts %d, fmt_type %d \n",
+            ctx->v_infos[i].pixelformat, ctx->v_infos[i].fmt_cnts, ctx->v_infos[i].fmt_type);
+        for(j = 0; j < ctx->v_infos[i].fmt_cnts; j++){
+            if(ctx->v_infos[i].fmt_type == V4L2_FRMSIZE_TYPE_DISCRETE){
+                DBG("\t [%d] width %d, height %d \n", j,
+                    ((struct v4l2_frmsize_discrete *)ctx->v_infos[i].fmt_info)[j].width,
+                    ((struct v4l2_frmsize_discrete *)ctx->v_infos[i].fmt_info)[j].height);
+            }else if(ctx->v_infos[i].fmt_type == V4L2_FRMSIZE_TYPE_STEPWISE){
+                DBG("\t [%d] width [%d-%d], height [%d-%d], step [%d-%d] \n", j,
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[i].fmt_info)[j].min_width,
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[i].fmt_info)[j].max_width,
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[i].fmt_info)[j].min_height,
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[i].fmt_info)[j].max_height,
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[i].fmt_info)[j].step_width,
+                    ((struct v4l2_frmsize_stepwise *)ctx->v_infos[i].fmt_info)[j].step_height);
+            }
+        }
+    }
+
+    return ret;
+}
+
+static int v4l2_set_ctrls(v4l2_context_t *ctx, enum Cam_Ctrl type, int status)
+{
+    int ret = 0;
+    static int bright = 0, contrast = 0, sharpness = 0, gamma = 0;
+    float bright_coef = 0, contrast_coef = 0, sharpness_coef = 0, gamma_coef = 0;
+    int cmd = 0, dir = 0;
+    struct v4l2_control ctl;
+    const char *str = NULL;
+
+    switch (type){
+        case CAM_MODE_DEFAULT:
+            bright_coef = 2.1;
+            contrast_coef = 2.1;
+            sharpness_coef = 5.0;
+            gamma_coef = 3.1;
+            str = "default";
+            break;
+        case CAM_MODE_SOFT:
+            bright_coef = 2.1;
+            contrast_coef = 2.1;
+            sharpness_coef = 7.5;
+            gamma_coef = 1.2;
+            str = "soft";
+            break;
+        case CAM_MODE_STANDARD:
+            bright_coef = 2.1;
+            contrast_coef = 2.1;
+            sharpness_coef =7.5;
+            gamma_coef = 3.1;
+            str = "standard";
+            break;
+        case CAM_MODE_CLEAR:
+            bright_coef = 2.1;
+            contrast_coef = 2.1;
+            sharpness_coef = 2.5;
+            gamma_coef = 3.1;
+            str = "clear";
+            break;
+        case CAM_MODE_BRIGHT:
+            bright_coef = 2.1;
+            contrast_coef = 1.6;
+            sharpness_coef = 7.5;
+            gamma_coef = 3.1;
+            str = "bright";
+            break;
+        case CAM_MODE_COMPUTER:
+            bright_coef = 3.0;
+            contrast_coef = 1.8;
+            sharpness_coef = 7.5;
+            gamma_coef = 1.4;
+            str = "computer";
+            break;
+        case CAM_MODE_CLEAR_LED:
+            bright_coef = 2.1;
+            contrast_coef = 1.8;
+            sharpness_coef = 5.0;
+            gamma_coef = 1.7;
+            str = "clear_led";
+            break;
+        case CAM_MODE_FACIAL_FEATURES:
+            bright_coef = 2.1;
+            contrast_coef = 1.8;
+            sharpness_coef = 7.5;
+            gamma_coef = 1.7;
+            str = "facial features";
+            break;
+        case CAM_CTRL_PAN_LEFT:
+            dir = 1;
+            cmd = V4L2_CID_PAN_SPEED;
+            str = "pan left";
+            break;
+        case CAM_CTRL_PAN_RIGHT:
+            dir = -1;
+            cmd = V4L2_CID_PAN_SPEED;
+            str = "pan right";
+            break;
+        case CAM_CTRL_TILT_UP:
+            dir = 1;
+            cmd = V4L2_CID_TILT_SPEED;
+            str = "tilt up";
+            break;
+        case CAM_CTRL_TILT_DOWN:
+            dir = -1;
+            cmd = V4L2_CID_TILT_SPEED;
+            str = "tilt down";
+            break;
+        case CAM_CTRL_ZOOM_IN:
+            dir = 1;
+            cmd = V4L2_CID_ZOOM_CONTINUOUS;
+            str = "zoom in";
+            break;
+        case CAM_CTRL_ZOOM_OUT:
+            dir = -1;
+            cmd = V4L2_CID_ZOOM_CONTINUOUS;
+            str = "zoom out";
+            break;
+        defaut:
+            ERR("video ctrl set -> unknow cmd : %d\n", type);
+            goto exit;
+    }
+
+    DBG("VIDIOC S_CTRL [%s - %d] \n", str, status);
+    if(!cmd){
+        int index = 0;
+        int b = 0, c = 0, s = 0, g = 0;
+        vidctl_node *vnode = NULL;
+
+        index = V4L2_CID_BRIGHTNESS%HASH_TABLE_NUM;
+        if((vnode = ctx->vidctl[index]) == NULL)
+            ERR("V4L2_CID_BRIGHTNESS ctrl not support!\n");
+        while(vnode != NULL){
+            if(vnode->key == V4L2_CID_BRIGHTNESS){
+                b  = (int) vnode->range/bright_coef;
+                break;
+            }else{
+                vnode = vnode->next;
+            }
+        }
+        index = V4L2_CID_CONTRAST%HASH_TABLE_NUM;
+        if((vnode = ctx->vidctl[index]) == NULL)
+            ERR("V4L2_CID_CONTRAST ctrl not support!\n");
+        while(vnode != NULL){
+            if(vnode->key == V4L2_CID_CONTRAST){
+                c = (int) vnode->range/contrast_coef;
+                break;
+            }else{
+                vnode = vnode->next;
+            }
+        }
+        index = V4L2_CID_SHARPNESS%HASH_TABLE_NUM;
+        if((vnode = ctx->vidctl[index]) == NULL)
+            ERR("V4L2_CID_SHARPNESS ctrl not support!\n");
+        while(vnode != NULL){
+            if(vnode->key == V4L2_CID_SHARPNESS){
+                s = (int) vnode->range/sharpness_coef;
+                break;
+            }else{
+                vnode = vnode->next;
+            }
+        }
+        index = V4L2_CID_GAMMA%HASH_TABLE_NUM;
+        if((vnode = ctx->vidctl[index]) == NULL)
+            ERR("V4L2_CID_GAMMA ctrl not support!\n");
+        while(vnode != NULL){
+            if(vnode->key == V4L2_CID_GAMMA){
+                g = (int) vnode->range/gamma_coef;
+                g += vnode->min;
+                break;
+            }else{
+                vnode = vnode->next;
+            }
+        }
+
+        DBG("camera view mode config [%d,%d,%d,%d]!\n",b,c,s,g);
+        if(bright != b){
+            bright = b;
+            ctl.id = V4L2_CID_BRIGHTNESS;
+            ctl.value = bright;
+            if((ret = xioctl(ctx->fd, VIDIOC_S_CTRL, &ctl)) == -1)
+                errno_exit(ctx,"VIDIOC_S_CTRL for brightness");
+        }
+        if(contrast != c){
+            contrast = c;
+            ctl.id = V4L2_CID_CONTRAST;
+            ctl.value = contrast;
+            if((ret = xioctl(ctx->fd, VIDIOC_S_CTRL, &ctl)) == -1)
+                errno_exit(ctx,"VIDIOC_S_CTRL for contrast");
+        }
+        if(sharpness != s){
+            sharpness = s;
+            ctl.id = V4L2_CID_SHARPNESS;
+            ctl.value = sharpness;
+            if((ret = xioctl(ctx->fd, VIDIOC_S_CTRL, &ctl)) == -1)
+                errno_exit(ctx,"VIDIOC_S_CTRL for sharpness");
+        }
+        if(gamma != g){
+            gamma = g;
+            ctl.id = V4L2_CID_GAMMA;
+            ctl.value = gamma;
+            if((ret = xioctl(ctx->fd, VIDIOC_S_CTRL, &ctl)) == -1)
+                errno_exit(ctx,"VIDIOC_S_CTRL for gamma");
+        }
+    }else{
+        int index = 0;
+        int speed = 0;
+        vidctl_node *vnode = NULL;
+
+        index = cmd%HASH_TABLE_NUM;
+        if((vnode = ctx->vidctl[index]) == NULL){
+            ERR("camera ptz-ctrl[0x%x] not support!\n",cmd);
+            speed = 0xffffffff;
+        }
+        while(vnode != NULL){
+            if(vnode->key == cmd){
+                if(dir > 0)
+                    speed = vnode->max;
+                else
+                    speed = vnode->min;
+                break;
+            }else{
+                vnode = vnode->next;
+            }
+        }
+        if(speed != 0xffffffff){
+            if(status == 0)
+                ctl.value = 0;
+            else
+                ctl.value = speed*2/3;
+            DBG("camera ptz adjust [0x%x][%s][%d-%d] !\n",cmd ,status>0?"start":"stop", speed, ctl.value);
+            ctl.id = cmd;
+            if(xioctl(ctx->fd, VIDIOC_S_CTRL, &ctl) == -1)
+                errno_exit(ctx,"VIDIOC_S_CTRL for camera ptz");
+        }
+    }
+
+exit:
+    return ret;
+}
+
+static int v4l2_enum_ctrls(v4l2_context_t *ctx)
+{
+    struct v4l2_queryctrl queryctrl;
+    struct v4l2_query_ext_ctrl extqueryctrl;
+    int i = 0;
+
+    queryctrl.id = V4L2_CID_BASE;
+    while (xioctl(ctx->fd, VIDIOC_QUERYCTRL, &queryctrl) == 0) {
+        int index = 0;
+
+        DBG("Name: %s ID: 0x%x Type: %d Minimum: %d Maximum: %d Default: %d Flags: %u Step: %d \n",
+            queryctrl.name, queryctrl.id, queryctrl.type, queryctrl.minimum,
+            queryctrl.maximum, queryctrl.default_value, queryctrl.flags, queryctrl.step);
+        index = queryctrl.id % HASH_TABLE_NUM;
+        vidctl_node *vnode = (vidctl_node *)malloc(sizeof(vidctl_node));
+        vnode->key = queryctrl.id;
+        vnode->min = queryctrl.minimum;
+        vnode->max = queryctrl.maximum;
+        vnode->range = queryctrl.maximum-queryctrl.minimum+1;
+        if (ctx->vidctl[index] == NULL){
+            ctx->vidctl[index] = vnode;
+        }else{
+            vidctl_node *cur = ctx->vidctl[index];
+            while(cur->next != NULL){
+                cur = cur->next;
+            }
+            cur->next = vnode;
+        }
+        queryctrl.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
+    }
+
+    for(int i=0; i < HASH_TABLE_NUM; i++) {
+        vidctl_node *vnode = ctx->vidctl[i];
+        while(vnode !=NULL) {
+            DBG("id 0x%x, min %d, max %d, range %d \n",
+                vnode->key, vnode->min,
+                vnode->max, vnode->range);
+            vnode = vnode->next;
+        }
+    }
+
+#if 0
+    extqueryctrl.id = V4L2_CTRL_FLAG_NEXT_CTRL | V4L2_CTRL_FLAG_NEXT_COMPOUND;
+    while (xioctl(ctx->fd, VIDIOC_QUERY_EXT_CTRL, &extqueryctrl) == 0) {
+        DBG("Name: %s\n", extqueryctrl.name);
+        DBG("ID: 0x%x\n", extqueryctrl.id);
+        DBG("Type: %d\n", extqueryctrl.type);
+        DBG("Minimum: %ld\n", extqueryctrl.minimum);
+        DBG("Maximum: %ld\n", extqueryctrl.maximum);
+        DBG("Default: %ld\n", extqueryctrl.default_value);
+
+        DBG("ELEMS: %d\n", extqueryctrl.elems);
+        DBG("ELEM_SIZE: %d\n", extqueryctrl.elem_size);
+        DBG("ELEM_NUM: %d\n", extqueryctrl.nr_of_dims);
+        DBG("DIMS: %d %d %d %d \n",
+                extqueryctrl.dims[0],
+                extqueryctrl.dims[1],
+                extqueryctrl.dims[2],
+                extqueryctrl.dims[3]);
+
+        extqueryctrl.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
+    }
+#endif
+
+  return 0;
 }
 
 static void stop_capturing(v4l2_context_t *ctx)
@@ -597,27 +1069,6 @@ static void start_capturing(v4l2_context_t *ctx)
 
     if (-1 == xioctl(ctx->fd, VIDIOC_STREAMON, &type))
         errno_exit(ctx, "VIDIOC_STREAMON");
-}
-
-static void uninit_device(v4l2_context_t *ctx)
-{
-    unsigned int i;
-
-    if (ctx->n_buffers == 0)
-        return;
-
-    for (i = 0; i < ctx->n_buffers; ++i) {
-        if (-1 == munmap(ctx->buffers[i].start, ctx->buffers[i].length))
-            errno_exit(ctx, "munmap");
-        close(ctx->buffers[i].export_fd);
-        if(ctx->memtype)
-            drm_free(ctx->drm_fd, &ctx->buffers[i]);
-    }
-
-    if(ctx->memtype)
-        drm_close(ctx->drm_fd);
-    free(ctx->buffers);
-    ctx->n_buffers = 0;
 }
 
 static void init_mmap(v4l2_context_t *ctx)
@@ -712,64 +1163,57 @@ static void init_mmap(v4l2_context_t *ctx)
     }
 }
 
+static void deinit_device(v4l2_context_t *ctx)
+{
+    unsigned int i;
+
+    if (ctx->n_buffers == 0)
+        return;
+
+    for (i = 0; i < ctx->n_buffers; ++i) {
+        if (-1 == munmap(ctx->buffers[i].start, ctx->buffers[i].length))
+            errno_exit(ctx, "munmap");
+        close(ctx->buffers[i].export_fd);
+        if(ctx->memtype)
+            drm_free(ctx->drm_fd, &ctx->buffers[i]);
+    }
+
+    free(ctx->buffers);
+    ctx->n_buffers = 0;
+}
+
 static void init_device(v4l2_context_t *ctx)
 {
-    struct v4l2_capability cap;
     struct v4l2_streamparm param;
     struct v4l2_format fmt;
 
     CLEAR(param);
     CLEAR(fmt);
-    if (-1 == xioctl(ctx->fd, VIDIOC_QUERYCAP, &cap)) {
-        if (EINVAL == errno) {
-            ERR("%s: %s is no V4L2 device\n", ctx->dev_name,
-                ctx->dev_name);
-        } else {
-            errno_exit(ctx, "VIDIOC_QUERYCAP");
-        }
-    }
 
-    DBG("v4l2 capabilities 0x%x\n",cap.capabilities);
-
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) &&
-            !(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE)) {
-        ERR("%s: is not a video capture device, capabilities: %x\n",
-            ctx->dev_name, cap.capabilities);
-    }
-
-    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
-        ERR("%s: %s does not support streaming i/o\n", ctx->dev_name,
-            ctx->dev_name);
-    }
-
-    if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
-        DBG("v4l2 mode V4L2_CAP_VIDEO_CAPTURE, pix format 0x%x \n",ctx->format);
-        ctx->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        fmt.type = ctx->buf_type;
+    if (ctx->buf_type == V4L2_BUF_TYPE_VIDEO_CAPTURE){
         fmt.fmt.pix.width = ctx->width;
         fmt.fmt.pix.height = ctx->height;
         fmt.fmt.pix.pixelformat = ctx->format;
         fmt.fmt.pix.field = V4L2_FIELD_ANY;
-        if (ctx->limit_range)
-            fmt.fmt.pix.quantization = V4L2_QUANTIZATION_LIM_RANGE;
-        else
-            fmt.fmt.pix.quantization = V4L2_QUANTIZATION_FULL_RANGE;
-    } else if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
-        DBG("v4l2 mode V4L2_CAP_VIDEO_CAPTURE_MPLANE, pix format 0x%x \n",ctx->format);
-        ctx->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    } else if (ctx->buf_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE){
         fmt.type = ctx->buf_type;
         fmt.fmt.pix_mp.width = ctx->width;
         fmt.fmt.pix_mp.height = ctx->height;
         fmt.fmt.pix_mp.pixelformat = ctx->format;
         fmt.fmt.pix_mp.field = V4L2_FIELD_ANY;
-        if (ctx->limit_range)
-            fmt.fmt.pix_mp.quantization = V4L2_QUANTIZATION_LIM_RANGE;
-        else
-            fmt.fmt.pix_mp.quantization = V4L2_QUANTIZATION_FULL_RANGE;
     }
+    fmt.type = ctx->buf_type;
+    if (ctx->limit_range)
+        fmt.fmt.pix.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+    else
+        fmt.fmt.pix.quantization = V4L2_QUANTIZATION_FULL_RANGE;
 
     if (-1 == xioctl(ctx->fd, VIDIOC_S_FMT, &fmt))
         errno_exit(ctx, "VIDIOC_S_FMT");
+
+    DBG("Pixel[format 0x%x, size %d], Mode[%s] \n",ctx->format,
+        fmt.fmt.pix.sizeimage,ctx->buf_type==V4L2_BUF_TYPE_VIDEO_CAPTURE?
+        "V4L2_CAP_VIDEO_CAPTURE":"V4L2_CAP_VIDEO_CAPTURE_MPLANE");
 
     if(ctx->srcfps != 0){
         param.type = ctx->buf_type;
@@ -778,18 +1222,54 @@ static void init_device(v4l2_context_t *ctx)
         param.parm.capture.capturemode = ctx->buf_type;
 
         if (-1 == xioctl(ctx->fd, VIDIOC_S_PARM, &param))
-            errno_exit(ctx, "VIDIOC_S_FMT");
+            errno_exit(ctx, "VIDIOC_S_PARM");
     }
 
     if(ctx->memtype)
         drm_init_mmap(ctx);
     else
         init_mmap(ctx);
-
 }
 
 static void close_device(v4l2_context_t *ctx)
 {
+    int i = 0;
+
+    for(int i=0; i < HASH_TABLE_NUM; i++) {
+        vidctl_node *vnode = ctx->vidctl[i];
+        while(vnode != NULL) {
+            vidctl_node *tmp = vnode;
+            vnode = vnode->next;
+            free(tmp);
+        }
+    }
+
+    if(ctx->nv_infos) {
+        for(i=0; i < ctx->nv_infos; i++)
+            free(ctx->v_infos[i].fmt_info);
+        free(ctx->v_infos);
+    }
+
+    if(ctx->pipe) {
+        ctx->pipe = 0;
+        unlink(p_fifo);
+        pthread_join(camera_control, NULL);
+    }
+
+    if(ctx->vop == 1) {
+        ;
+    }
+
+    if (ctx->writeFile) {
+        fclose(ctx->fp);
+        ctx->fp = NULL;
+    }
+
+    if(ctx->memtype) {
+        drm_close(ctx->drm_fd);
+        ctx->drm_fd = -1;
+    }
+
     if (-1 == close(ctx->fd))
         errno_exit(ctx, "close");
 
@@ -799,12 +1279,11 @@ static void close_device(v4l2_context_t *ctx)
 static void open_device(v4l2_context_t *ctx)
 {
     DBG("-------- open output dev_name:%s -------------\n", ctx->dev_name);
-    ctx->fd = open(ctx->dev_name, O_RDWR /* required */ /*| O_NONBLOCK*/, 0);
-
+    ctx->fd = open(ctx->dev_name, O_RDWR | O_CLOEXEC /* required */ /*| O_NONBLOCK*/, 0);
     if (-1 == ctx->fd)
         errno_exit(ctx, "erro open v4l2dev\n");
 
-    if (ctx->memtype == 1){
+    if (ctx->memtype){
         ctx->drm_fd = drm_open();
         if (ctx->drm_fd == -1)
             errno_exit(ctx, "drm open failed");
@@ -818,10 +1297,16 @@ static void open_device(v4l2_context_t *ctx)
     }
 
     if(ctx->vop == 1){
-#ifdef V4L2_BUILD_DAEMO
-        init_render(ctx);
-#endif
+        ;
     }
+
+    if(ctx->pipe){
+        mkfifo(p_fifo, 0666);
+        pthread_create(&camera_control, NULL, &camera_thread, ctx);
+    }
+
+    v4l2_enum_fmt(ctx);
+    v4l2_enum_ctrls(ctx);
 
     if(ctx->stride_x == 0)
         ctx->stride_x = ctx->width;
@@ -832,42 +1317,82 @@ static void open_device(v4l2_context_t *ctx)
 void v4l2_deinit(v4l2_context_t *ctx)
 {
     stop_capturing(ctx);
-    uninit_device(ctx);
-    close_device(ctx);
-
-    if (ctx->fp)
-        fclose(ctx->fp);
-}
-
-static void signal_handle(int signo)
-{
-    DBG("force exit signo %d !!!\n", signo);
-
-    if (g_main_ctx) {
-        g_main_ctx->frame_count = 0;
-        v4l2_deinit(g_main_ctx);
-        g_main_ctx = NULL;
-    }
-
-    exit(0);
+    deinit_device(ctx);
 }
 
 void v4l2_routine(v4l2_context_t *ctx)
 {
-    open_device(ctx);
     init_device(ctx);
     start_capturing(ctx);
 }
 
-#ifdef V4L2_BUILD_DAEMO
-static void init_render(v4l2_context_t *ctx)
+void *camera_thread(void *arg)
 {
-    byteview::VideoRenderConfig c = byteview::VideoRenderConfig(byteview::VideoRenderType::tEGL);
-    c.setMediaDemo(true);
-    c.setZindex(1);
+    v4l2_context_t *ctx = (v4l2_context_t *)arg;
+    char buf[64] = {0};
+    int fd = -1;
+    int len = 0;
 
-    std::shared_ptr<byteview::VideoRenderer> videoRender = byteview::VideoRenderer::create(c);
-    v4l2_videoRenderer = videoRender;
+    fd = open(p_fifo, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
+    if(fd < 0){
+        errno_exit(ctx,"open fifo error");
+        goto rtn;
+    }
+    while(ctx->pipe){
+        memset(buf, 0, sizeof(buf));
+        len = read(fd, buf, sizeof(buf));
+        if(len > 0){
+            int type = -1,cmd = -1;
+            char *token;
+            char *str = buf;
+
+            DBG("len-> %zu , cmd-> %s",strlen(buf),buf);
+            if(!memcmp(buf,"mode",4)){
+                type = 0;
+            }else if(!memcmp(buf,"ctrl",4)){
+                type = 1;
+            }else{
+                ERR("unknow cmd!");
+                continue;
+            }
+            token = strsep(&str,":");
+            token = strsep(&str,":");
+            enum Cam_Ctrl mode = (enum Cam_Ctrl)atoi(token);
+            if(type){
+                token = strsep(&str,":");
+                cmd = (enum Cam_Ctrl)atoi(token);
+            }
+
+            if(type == 0) {
+                DBG("view mode config !\n");
+                if(mode > CAM_MODE_FACIAL_FEATURES){
+                    ERR("camera view mode unknow [%d] !\n",mode);
+                    continue;
+                }
+                v4l2_set_ctrls(ctx, mode, 1);
+            }else if (type == 1) {
+                DBG("ptz ctrl config !\n");
+                if(mode > CAM_CTRL_ZOOM_OUT){
+                    ERR("camera ctrl type unknow [%c] !\n",mode);
+                    continue;
+                } else if (cmd != 0 && cmd != 1) {
+                    ERR("camera ctrl cmd unknow [%c] !\n",cmd);
+                    continue;
+                }
+                v4l2_set_ctrls(ctx, mode, cmd);
+            }else{
+                ERR("cmd bad format !\n");
+            }
+        }else{
+            if(len == -1 && errno != EAGAIN && errno != EINTR)
+                ERR("error %d, %s\n", errno, strerror(errno));
+            usleep(60*1000);
+        }
+    }
+
+rtn:
+    close(fd);
+    pthread_exit(NULL);
 }
 
 static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
@@ -893,14 +1418,15 @@ static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
             {"hdr",           required_argument, 0, 'a' },
             {"sync-to-raw",   no_argument,  0, 'e' },
             {"count",    required_argument, 0, 'c' },
-            {"help",     no_argument,       0, 'p' },
             {"silent",   no_argument,       0, 's' },
             {"limit",    no_argument,       0, 'l' },
+            {"pipe",     no_argument,       0, 'y' },
+            {"help",     no_argument,       0, 'p' },
             {0,          0,                 0,  0  }
         };
 
         //c = getopt_long(argc, argv, "w:h:f:i:d:o:c:ps",
-        c = getopt_long(argc, argv, "w:h:f:i:t:m:vd:o:n:k:c:a:psel",
+        c = getopt_long(argc, argv, "w:h:f:i:t:m:vd:o:n:k:c:a:psely",
                         long_options, &option_index);
         if (c == -1)
             break;
@@ -932,7 +1458,10 @@ static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
             ctx->memtype = atoi(optarg);
             break;
         case 'v':
-            ctx->vop = 1; 
+            ctx->vop = 1;
+            break;
+        case 'y':
+            ctx->pipe = 1;
             break;
         case 'o':
             strcpy(ctx->out_file, optarg);
@@ -981,6 +1510,7 @@ usage:
         "         --device,                          required, path of video device\n"
         "         --memtype,                         optional, 0:v4l2 fd, 1:drm fd, default 0\n"
         "         --vop,                             optional, frame render out\n"
+        "         --pipe,                            optional, create fifo pipe for rpc\n"
         "         --stream-to,                       optional, output file path, if <file> is '-', then the data is written to stdout\n"
         "         --stream-count, default 60         optional, how many frames to write files\n"
         "         --stream-skip, default 30          optional, how many frames to skip befor writing file\n"
@@ -992,6 +1522,20 @@ usage:
     exit(-1);
 }
 
+static void signal_handle(int signo)
+{
+    DBG("force exit signo %d !!!\n", signo);
+
+    if (g_main_ctx) {
+        g_main_ctx->frame_count = 0;
+        v4l2_deinit(g_main_ctx);
+        close_device(g_main_ctx);
+        g_main_ctx = NULL;
+    }
+
+    exit(0);
+}
+
 int main(int argc, char **argv)
 {
     sigset_t mask;
@@ -1000,6 +1544,8 @@ int main(int argc, char **argv)
     sigaddset(&mask, SIGTERM);
     sigaddset(&mask, SIGQUIT);
     pthread_sigmask(SIG_BLOCK, &mask, NULL);
+    int i = 0;
+    char buf[16] = {0};
 
     struct sigaction new_action, old_action;
     new_action.sa_handler = signal_handle;
@@ -1026,7 +1572,7 @@ int main(int argc, char **argv)
         .memtype = 0,
         .vop = 0,
         .fd = -1,
-        .buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .buf_type = V4L2_BUF_TYPE_PRIVATE,
         .buffers = NULL,
         .n_buffers = 0,
         .frame_count = -1,
@@ -1037,20 +1583,45 @@ int main(int argc, char **argv)
         .limit_range = 0,
         .outputCnt = 60,
         .skipCnt = 30,
+        .nv_infos = 0,
+        .pipe = 0,
         .yuv_dir_path = {'\0'},
         ._is_yuv_dir_exist = 0,
         .capture_yuv_num = 0,
         .is_capture_yuv = 0,
     };
     parse_args(argc, argv, &main_ctx);
+
+    /* start up rkaiq service */
+    __system_property_set("bytedlark.rkaiq.on", "1");
+    while(i++ < 10) {
+        __system_property_get("bytedlark.rkaiq.running",buf);
+        if(buf[0] == '0') {
+            DBG("%s, waiting for rkisp service ready\n",__FUNCTION__);
+            usleep(50*1000);
+        }else{
+            DBG("%s, %s",__FUNCTION__,
+                buf[0] == '1'?"rkisp status -> [running]!\n":
+                buf[0] == '2'?"rkisp status -> [disabled]!\n":
+                "rkisp status -> [unkown]!\n");
+            break;
+        }
+    }
+    if(i == 10)
+        ERR("%s->[error] waiting for rkisp service timeout!"
+          "video capture maybe unnormal!",__FUNCTION__);
+    __system_property_set("bytedlark.rkaiq.running","0");
+
+    open_device(&main_ctx);
+    if(v4l2_check_fmt(&main_ctx) < 0)
+        goto rtn;
     v4l2_routine(&main_ctx);
     g_main_ctx = &main_ctx;
     pthread_sigmask(SIG_UNBLOCK, &mask, NULL);
     mainloop(&main_ctx);
     v4l2_deinit(&main_ctx);
+rtn:
+    close_device(&main_ctx);
 
     return 0;
 }
-#else
-#include "video_capture.cpp"
-#endif
