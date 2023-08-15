@@ -1,8 +1,8 @@
 1 Application.mk
 
-APP_ABI       := armeabi-v7a arm64-v8a
-APP_PLATFORM  := android-31
-APP_STL       := c++_static
+APP_ABI        := armeabi-v7a arm64-v8a
+APP_PLATFORM   := android-31
+APP_STL        := c++_shared
 APP_STRIP_MODE := none
 
 2 Android.mk
@@ -50,3 +50,7 @@ https://developer.android.google.cn/ndk/downloads?hl=zh-cn
 4 api version
 https://developer.android.com/studio/releases/platforms?hl=zh-cn#13
 
+5 diff+patch git merge
+ $ diff -uprN linux-2.6.31.3 linux-2.6.31.3_1/ > mypatch
+ $ cd linux-2.6.31.3
+ $ patch -p1 < mypatch

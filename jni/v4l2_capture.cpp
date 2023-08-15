@@ -25,11 +25,17 @@
 #include <drm/drm_mode.h>
 #include <pthread.h>
 #include <sys/system_properties.h>
-#include <linux/videodev2.h>
+#include "utils/log_utils.h"
+#include "v4l2/videodev2.h"
+#ifdef V4L2_BUILD_DAEMO
+#include "video_render/render/VideoRendererManager.h"
+#include "common/video_frame/VideoFrame.h"
+static std::shared_ptr<byteview::VideoRenderer> v4l2_videoRenderer;
+#endif
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 #define FMT_NUM_PLANES 1
-#define BUFFER_COUNT 6
+#define BUFFER_COUNT 4
 #define HASH_TABLE_NUM 128
 #define CAPTURE_RAW_PATH "/data"
 #define DEFAULT_CAPTURE_RAW_PATH "/data/capture_image"
@@ -97,6 +103,7 @@ typedef struct v4l2_context {
     int _is_yuv_dir_exist;
     int capture_yuv_num;
     int is_capture_yuv;
+    unsigned int log_interval;
 } v4l2_context_t;
 
 struct buffer {
@@ -121,8 +128,16 @@ static const char *p_fifo = "/mnt/.fifobyted";
 pthread_t camera_control;
 void *camera_thread(void *arg);
 
+#ifdef V4L2_BUILD_DAEMO
+static byteview::FrameType frmtype = byteview::FrameType::kNv12_OESFD;
+static void init_render(v4l2_context_t *ctx);
+static void deinit_render(v4l2_context_t *ctx);
 #define DBG(...) do { if(!silent) { printf("[%s-%d]--> ",__func__,__LINE__); printf(__VA_ARGS__);} } while(0)
 #define ERR(...) do { printf("[%s-%d]--> ",__func__,__LINE__); printf(__VA_ARGS__); } while (0)
+#else
+#define DBG BYTE_LOGD
+#define ERR BYTE_LOGE
+#endif
 
 static void errno_exit(v4l2_context_t *ctx, const char *s)
 {
@@ -174,6 +189,8 @@ static int drm_alloc(int drm_fd, size_t width, size_t height, struct buffer *buf
     CLEAR(dmcb);
     dmcb.bpp  = 8;
     switch(fmt){
+    default:
+        DBG("fix me!! using default nv12 format!\n");
     case V4L2_PIX_FMT_NV12:
     case V4L2_PIX_FMT_NV21:
         dmcb.width  = width;
@@ -190,11 +207,6 @@ static int drm_alloc(int drm_fd, size_t width, size_t height, struct buffer *buf
     case V4L2_PIX_FMT_VYUY:
         dmcb.width  = width*2;
         dmcb.height = height;
-        break;
-    default:
-        ERR("unsupporrt type,using default nv12 format!\n");
-        dmcb.bpp    = 8;
-        dmcb.height = height*3/2;
         break;
     }
     /* aligned with 16 bytes */
@@ -426,7 +438,8 @@ static int creat_yuv_dir(const char* path, v4l2_context_t *ctx)
 static void process_image(const void *p, int sequence, int size, v4l2_context_t *ctx)
 {
     if (ctx->fp && sequence >= ctx->skipCnt && ctx->outputCnt-- > 0) {
-        DBG("frame : <%d> \n",sequence+1);
+        if(ctx->log_interval > 0x80000000)
+            DBG("frame : <%d> \n",sequence+1);
         fwrite(p, size, 1, ctx->fp);
         fflush(ctx->fp);
     } else if (ctx->writeFileSync) {
@@ -494,27 +507,31 @@ static int v4l2_read_frame(v4l2_context_t *ctx)
     export_fd = ctx->buffers[i].export_fd;
     v4l2_buf = &buf;
 
+    if(ctx->log_interval > 0x80000000)
+        ctx->log_interval &= ~0x80000000;
+    if(buf.sequence == 1 || buf.sequence%ctx->log_interval == 0)
+        ctx->log_interval |= 0x80000000;
+
     if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == ctx->buf_type)
         bytesused = buf.m.planes[0].bytesused;
     else
         bytesused = buf.bytesused;
 
-    if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == ctx->buf_type) {
-        DBG("%s: fd-[%d] -> v4l2_plane [bytesused %d, length %d,"
-            "mem_offset %d,data_offset %d], frame [%d]\n",
-            ctx->dev_name, export_fd, buf.m.planes[0].bytesused, buf.m.planes[0].length,
-            buf.m.planes[0].m.mem_offset, buf.m.planes[0].data_offset,buf.sequence);
-    }else{
-        DBG("%s: fd-[%d] -> v4l2_buffer [type: %d, bytesused %d, mem_offset %d, length %d] \n ",
-            ctx->dev_name, export_fd, buf.type, buf.bytesused, buf.m.offset, buf.length);
-    }
+    if (ctx->format == V4L2_PIX_FMT_MJPEG ||
+            ctx->format == V4L2_PIX_FMT_H264 ||
+            ctx->format == V4L2_PIX_FMT_H265)
+        ctx->buffers[i].length = bytesused;
 
-    if(ctx->vop == 1 && !ctx->writeFileSync){
-        DBG("release frame fd:%d \n", export_fd);
-        if (-1 == xioctl(v4l2_fd, VIDIOC_QBUF, v4l2_buf)){
-            ret = -1;
-            errno_exit(ctx, "VIDIOC_QBUF");
-        }
+    if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == ctx->buf_type) {
+        if(ctx->log_interval > 0x80000000)
+            DBG("%s: fd-[%d] -> v4l2_plane [bytesused %d, length %d,"
+              "mem_offset %d,data_offset %d], frame [%d]\n",
+              ctx->dev_name, export_fd, buf.m.planes[0].bytesused, buf.m.planes[0].length,
+              buf.m.planes[0].m.mem_offset, buf.m.planes[0].data_offset,buf.sequence);
+    }else{
+        if(ctx->log_interval > 0x80000000)
+            DBG("%s: fd-[%d] -> v4l2_buffer [type: %d, bytesused %d, mem_offset %d, length %d] \n ",
+              ctx->dev_name, export_fd, buf.type, buf.bytesused, buf.m.offset, buf.length);
     }
 
     if(ctx->writeFile || ctx->writeFileSync){
@@ -525,6 +542,28 @@ static int v4l2_read_frame(v4l2_context_t *ctx)
                 errno_exit(ctx, "VIDIOC_QBUF");
             }
         }
+    }
+
+    if(ctx->vop == 1){
+#ifdef V4L2_BUILD_DAEMO
+        int rate_control = 0;
+        std::shared_ptr<byteview::VideoFrame> videoFrame = std::make_shared<byteview::VideoFrame>(
+            (int)ctx->width, (int)ctx->height, ctx->stride_x, ctx->stride_y, frmtype, "0");
+        videoFrame->setFd(export_fd);
+        rate_control = ctx->log_interval>0x80000000?1:0;
+        videoFrame->setReleaseFunction([v4l2_fd,export_fd,v4l2_buf,rate_control]
+            {
+                if (rate_control)
+                    DBG("release frame fd:%d \n", export_fd);
+                if (-1 == xioctl(v4l2_fd, VIDIOC_QBUF, v4l2_buf))
+                    ERR("videoFrame QBUF error %d, %s\n", errno, strerror(errno));
+            }
+        );
+
+        v4l2_videoRenderer->updateFrame(videoFrame);
+#else
+        ret = i;
+#endif
     }
 
     if(!ctx->vop && !ctx->writeFile && !ctx->writeFileSync){
@@ -559,7 +598,8 @@ int v4l2_release_frame(v4l2_context *ctx, int index)
         return -1;
     }
 
-    DBG("%s: release frame fd:%d \n",ctx->dev_name, ctx->buffers[index].export_fd);
+    if(ctx->log_interval > 0x80000000)
+        DBG("%s: release frame fd:%d \n",ctx->dev_name, ctx->buffers[index].export_fd);
 
     return 0;
 }
@@ -631,7 +671,7 @@ static int v4l2_check_fmt(v4l2_context_t *ctx)
     else if(found == 0)
         DBG("[Warning]: the width&height setting is not standard config for camera!\n");
     else if(found == 1)
-        DBG("[%s]: current setting is suitale for camera!\n",__FUNCTION__);
+        DBG("[%s]: current setting is suitable for camera!\n",__FUNCTION__);
 
     return found;
 }
@@ -1257,7 +1297,9 @@ static void close_device(v4l2_context_t *ctx)
     }
 
     if(ctx->vop == 1) {
-        ;
+#ifdef V4L2_BUILD_DAEMO
+        deinit_render(ctx);
+#endif
     }
 
     if (ctx->writeFile) {
@@ -1297,7 +1339,9 @@ static void open_device(v4l2_context_t *ctx)
     }
 
     if(ctx->vop == 1){
-        ;
+#ifdef V4L2_BUILD_DAEMO
+        init_render(ctx);
+#endif
     }
 
     if(ctx->pipe){
@@ -1308,10 +1352,26 @@ static void open_device(v4l2_context_t *ctx)
     v4l2_enum_fmt(ctx);
     v4l2_enum_ctrls(ctx);
 
-    if(ctx->stride_x == 0)
+    ctx->stride_y = (ctx->height+15)&~15;
+    switch(ctx->format) {
+    default:
+        ERR("fix me!! using nv12 stride by default \n");
+    case V4L2_PIX_FMT_NV12:
+    case V4L2_PIX_FMT_NV21:
+    case V4L2_PIX_FMT_NV16:
+    case V4L2_PIX_FMT_NV61:
         ctx->stride_x = ctx->width;
-    if(ctx->stride_y == 0)
-        ctx->stride_y = ctx->height;
+        break;
+    case V4L2_PIX_FMT_YUYV:
+    case V4L2_PIX_FMT_YVYU:
+    case V4L2_PIX_FMT_UYVY:
+    case V4L2_PIX_FMT_VYUY:
+        // fix me!! actually 2*width
+        ctx->stride_x = ctx->width;
+        break;
+    }
+    ctx->log_interval = ctx->log_interval==0?1:30*ctx->log_interval;
+    DBG("frame log_interval every %d frames \n",ctx->log_interval);
 }
 
 void v4l2_deinit(v4l2_context_t *ctx)
@@ -1395,6 +1455,35 @@ rtn:
     pthread_exit(NULL);
 }
 
+#ifdef V4L2_BUILD_DAEMO
+static void init_render(v4l2_context_t *ctx)
+{
+    byteview::VideoRenderConfig c = byteview::VideoRenderConfig(byteview::VideoRenderType::tEGL);
+    c.setMediaDemo(true);
+    c.setZindex(1);
+
+    std::shared_ptr<byteview::VideoRenderer> videoRender = byteview::VideoRenderer::create(c);
+    v4l2_videoRenderer = videoRender;
+
+    if (ctx->format == V4L2_PIX_FMT_NV12)
+        frmtype = byteview::FrameType::kNv12_OESFD;
+    else if (ctx->format == V4L2_PIX_FMT_NV21)
+        frmtype = byteview::FrameType::kNv21_OESFD;
+    else if (ctx->format == V4L2_PIX_FMT_NV16)
+        frmtype = byteview::FrameType::kNv16_OESFD;
+    else if (ctx->format == V4L2_PIX_FMT_YUYV)
+        frmtype = byteview::FrameType::kYUYV_OESFD;
+    else
+        DBG("unsupported format,render default using nv12 \n");
+
+}
+
+static void deinit_render(v4l2_context_t *ctx)
+{
+    v4l2_videoRenderer->quit();
+    v4l2_videoRenderer = NULL;
+}
+
 static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
 {
     int c;
@@ -1411,13 +1500,14 @@ static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
             {"dstfps",   required_argument, 0, 't' },
             {"device",   required_argument, 0, 'd' },
             {"memtype",  required_argument, 0, 'm' },
-            {"vop",      no_argument      , 0, 'v' },
             {"stream-to",     required_argument, 0, 'o' },
             {"stream-count",  required_argument, 0, 'n' },
             {"stream-skip",   required_argument, 0, 'k' },
             {"hdr",           required_argument, 0, 'a' },
+            {"count",         required_argument, 0, 'c' },
+            {"log-interval",  required_argument, 0, 'g' },
             {"sync-to-raw",   no_argument,  0, 'e' },
-            {"count",    required_argument, 0, 'c' },
+            {"vop",      no_argument      , 0, 'v' },
             {"silent",   no_argument,       0, 's' },
             {"limit",    no_argument,       0, 'l' },
             {"pipe",     no_argument,       0, 'y' },
@@ -1436,11 +1526,9 @@ static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
             break;
         case 'w':
             ctx->width = atoi(optarg);
-            ctx->stride_x = atoi(optarg);
             break;
         case 'h':
             ctx->height = atoi(optarg);
-            ctx->stride_y = atoi(optarg);
             break;
         case 'i':
             ctx->srcfps = atoi(optarg);
@@ -1485,6 +1573,9 @@ static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
         case 'l':
             ctx->limit_range = 1;
             break;
+        case 'g':
+            ctx->log_interval = 30*atoi(optarg);
+            break;
         default:
             ERR("?? getopt returned character code 0%o ??\n", c);
         case '?':
@@ -1502,7 +1593,7 @@ static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
 usage:
     ERR("Usage: %s to capture frames\n"
         "         --width,  default 640,             optional, width of image\n"
-        "         --height, default 480,             optional, height of image\n"
+        "         --height, default 360,             optional, height of image\n"
         "         --srcfps, default 30,              optional, source fps of camera\n"
         "         --dstfps, default 30,              optional, output fps of camera\n"
         "         --format, default NV12,            optional, fourcc of format\n"
@@ -1510,7 +1601,7 @@ usage:
         "         --device,                          required, path of video device\n"
         "         --memtype,                         optional, 0:v4l2 fd, 1:drm fd, default 0\n"
         "         --vop,                             optional, frame render out\n"
-        "         --pipe,                            optional, create fifo pipe for rpc\n"
+        "         --pipe,                            optional, create fifo pipe thread for rpc\n"
         "         --stream-to,                       optional, output file path, if <file> is '-', then the data is written to stdout\n"
         "         --stream-count, default 60         optional, how many frames to write files\n"
         "         --stream-skip, default 30          optional, how many frames to skip befor writing file\n"
@@ -1518,6 +1609,9 @@ usage:
         "         --hdr <val>,                       optional, hdr mode, val 2 means hdrx2, 3 means hdrx3 \n"
         "         --sync-to-raw,                     optional, write yuv files in sync with raw\n"
         "         --limit,                           optional, yuv limit range\n"
+        "         --log-interval,                    optional, frame log print intervals (second)\n"
+        "example:\n"
+        "         byted_lark_v4l2 -w 1920 -h 1080 -f NV12 -c 120 -d /dev/video11 -m 0 -v \n"
         ,argv[0]);
     exit(-1);
 }
@@ -1589,6 +1683,7 @@ int main(int argc, char **argv)
         ._is_yuv_dir_exist = 0,
         .capture_yuv_num = 0,
         .is_capture_yuv = 0,
+        .log_interval = 0,
     };
     parse_args(argc, argv, &main_ctx);
 
@@ -1625,3 +1720,7 @@ rtn:
 
     return 0;
 }
+#else
+#include "video_capture.cpp"
+#include "capture_node.cpp"
+#endif
