@@ -25,14 +25,20 @@
 #include <drm/drm_mode.h>
 #include <pthread.h>
 #include <sys/system_properties.h>
+#include <linux/videodev2.h>
 #include "utils/log_utils.h"
-#include "v4l2/videodev2.h"
+#include "video_capture.h"
 #ifdef V4L2_BUILD_DAEMO
 #include "video_render/render/VideoRendererManager.h"
 #include "common/video_frame/VideoFrame.h"
-static std::shared_ptr<byteview::VideoRenderer> v4l2_videoRenderer;
+using byteview::VideoRendererManager;
+static std::shared_ptr<byteview::VideoRendererManager> v4l2_videoRenderer;
+#else
+using byteview::VideoCapture;
+using byteview::HdmiHotplug;
 #endif
 
+#define V4L2_PIX_FMT_H265     v4l2_fourcc('H', '2', '6', '5') /* H265 with start codes */
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 #define FMT_NUM_PLANES 1
 #define BUFFER_COUNT 4
@@ -40,6 +46,8 @@ static std::shared_ptr<byteview::VideoRenderer> v4l2_videoRenderer;
 #define CAPTURE_RAW_PATH "/data"
 #define DEFAULT_CAPTURE_RAW_PATH "/data/capture_image"
 #define CAPTURE_CNT_FILENAME ".capture_cnt"
+#define HDMIRX_RESOLUTION_CHANGE   5
+#define HDMIRX_HOTPLUG_EVENT       0x8000001
 
 enum Cam_Ctrl {
     /* view mode settings */
@@ -97,13 +105,16 @@ typedef struct v4l2_context {
     struct video_fmts *v_infos;
     unsigned int nv_infos;
     int pipe;
+    int hdmirx;
     vidctl_node *vidctl[HASH_TABLE_NUM];
-
     char yuv_dir_path[64];
     int _is_yuv_dir_exist;
     int capture_yuv_num;
     int is_capture_yuv;
     unsigned int log_interval;
+#if !defined(V4L2_BUILD_DAEMO)
+    HdmiHotplug *hdmi_event;
+#endif
 } v4l2_context_t;
 
 struct buffer {
@@ -125,8 +136,15 @@ static int silent;
 static v4l2_context_t *g_main_ctx = NULL;
 static const char *dev_drm = "/dev/dri/card0";
 static const char *p_fifo = "/mnt/.fifobyted";
-pthread_t camera_control;
-void *camera_thread(void *arg);
+static pthread_t camera_control;
+static pthread_t hdmi_detect;
+static void *camera_thread(void *arg);
+static void *hdmirx_thread(void *arg);
+/* 1: plugin->plugout 2: plugout->plugin */
+static int hdmirx_hotplug = 0;
+static int hdmirx_thd = 0;
+static int frame_nums = 0;
+static int log_rate = 0;
 
 #ifdef V4L2_BUILD_DAEMO
 static byteview::FrameType frmtype = byteview::FrameType::kNv12_OESFD;
@@ -142,8 +160,12 @@ static void deinit_render(v4l2_context_t *ctx);
 static void errno_exit(v4l2_context_t *ctx, const char *s)
 {
     ERR("%s: %s error %d, %s\n", ctx->dev_name, s, errno, strerror(errno));
+
+    /*using no-block mode, don't exit*/
+    /*
     if(!ctx->vop)
         exit(-1);
+    */
 }
 
 static int xioctl(int fh, int request, void *arg)
@@ -438,7 +460,7 @@ static int creat_yuv_dir(const char* path, v4l2_context_t *ctx)
 static void process_image(const void *p, int sequence, int size, v4l2_context_t *ctx)
 {
     if (ctx->fp && sequence >= ctx->skipCnt && ctx->outputCnt-- > 0) {
-        if(ctx->log_interval > 0x80000000)
+        if(log_rate > 0x80000000)
             DBG("frame : <%d> \n",sequence+1);
         fwrite(p, size, 1, ctx->fp);
         fflush(ctx->fp);
@@ -500,17 +522,20 @@ static int v4l2_read_frame(v4l2_context_t *ctx)
 
     if (-1 == xioctl(v4l2_fd, VIDIOC_DQBUF, &buf)){
         ret = -1;
-        errno_exit(ctx, "VIDIOC_DQBUF");
+        /*hdmirx mode always success on v4l2 side*/
+        if (!ctx->hdmirx)
+            errno_exit(ctx, "VIDIOC_DQBUF");
+        return ret;
     }
 
     i  = buf.index;
     export_fd = ctx->buffers[i].export_fd;
     v4l2_buf = &buf;
 
-    if(ctx->log_interval > 0x80000000)
-        ctx->log_interval &= ~0x80000000;
-    if(buf.sequence == 1 || buf.sequence%ctx->log_interval == 0)
-        ctx->log_interval |= 0x80000000;
+    if(log_rate > 0x80000000)
+        log_rate &= ~0x80000000;
+    if(buf.sequence == 1 || buf.sequence%log_rate == 0)
+        log_rate |= 0x80000000;
 
     if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == ctx->buf_type)
         bytesused = buf.m.planes[0].bytesused;
@@ -523,13 +548,13 @@ static int v4l2_read_frame(v4l2_context_t *ctx)
         ctx->buffers[i].length = bytesused;
 
     if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == ctx->buf_type) {
-        if(ctx->log_interval > 0x80000000)
+        if(log_rate > 0x80000000)
             DBG("%s: fd-[%d] -> v4l2_plane [bytesused %d, length %d,"
               "mem_offset %d,data_offset %d], frame [%d]\n",
               ctx->dev_name, export_fd, buf.m.planes[0].bytesused, buf.m.planes[0].length,
               buf.m.planes[0].m.mem_offset, buf.m.planes[0].data_offset,buf.sequence);
-    }else{
-        if(ctx->log_interval > 0x80000000)
+    } else {
+        if(log_rate > 0x80000000)
             DBG("%s: fd-[%d] -> v4l2_buffer [type: %d, bytesused %d, mem_offset %d, length %d] \n ",
               ctx->dev_name, export_fd, buf.type, buf.bytesused, buf.m.offset, buf.length);
     }
@@ -539,7 +564,10 @@ static int v4l2_read_frame(v4l2_context_t *ctx)
         if(!ctx->vop){
             if (-1 == xioctl(v4l2_fd, VIDIOC_QBUF, v4l2_buf)){
                 ret = -1;
-                errno_exit(ctx, "VIDIOC_QBUF");
+                /*hdmirx mode always success on v4l2 side*/
+                if (!ctx->hdmirx)
+                    errno_exit(ctx, "VIDIOC_QBUF");
+                return ret;
             }
         }
     }
@@ -548,9 +576,9 @@ static int v4l2_read_frame(v4l2_context_t *ctx)
 #ifdef V4L2_BUILD_DAEMO
         int rate_control = 0;
         std::shared_ptr<byteview::VideoFrame> videoFrame = std::make_shared<byteview::VideoFrame>(
-            (int)ctx->width, (int)ctx->height, ctx->stride_x, ctx->stride_y, frmtype, "0");
+            (int)ctx->width, (int)ctx->height, ctx->stride_x, ctx->stride_y, frmtype, "bd_vi");
         videoFrame->setFd(export_fd);
-        rate_control = ctx->log_interval>0x80000000?1:0;
+        rate_control = log_rate>0x80000000?1:0;
         videoFrame->setReleaseFunction([v4l2_fd,export_fd,v4l2_buf,rate_control]
             {
                 if (rate_control)
@@ -569,7 +597,10 @@ static int v4l2_read_frame(v4l2_context_t *ctx)
     if(!ctx->vop && !ctx->writeFile && !ctx->writeFileSync){
         if (-1 == xioctl(v4l2_fd, VIDIOC_QBUF, v4l2_buf)){
             ret = -1;
-            errno_exit(ctx, "VIDIOC_QBUF");
+            /*hdmirx mode always success on v4l2 side*/
+            if (!ctx->hdmirx)
+                errno_exit(ctx, "VIDIOC_QBUF");
+            return ret;
         }
     }
 
@@ -598,18 +629,10 @@ int v4l2_release_frame(v4l2_context *ctx, int index)
         return -1;
     }
 
-    if(ctx->log_interval > 0x80000000)
+    if(log_rate > 0x80000000)
         DBG("%s: release frame fd:%d \n",ctx->dev_name, ctx->buffers[index].export_fd);
 
     return 0;
-}
-
-static void mainloop(v4l2_context_t *ctx)
-{
-    int ret = 0;
-
-    while ((ctx->frame_count == -1) || (ctx->frame_count-- > 0))
-       v4l2_read_frame(ctx);
 }
 
 static int v4l2_check_fmt(v4l2_context_t *ctx)
@@ -1281,13 +1304,17 @@ static void close_device(v4l2_context_t *ctx)
             vidctl_node *tmp = vnode;
             vnode = vnode->next;
             free(tmp);
+            tmp = NULL;
         }
     }
 
     if(ctx->nv_infos) {
-        for(i=0; i < ctx->nv_infos; i++)
+        for(i=0; i < ctx->nv_infos; i++) {
             free(ctx->v_infos[i].fmt_info);
+            ctx->v_infos[i].fmt_info = NULL;
+        }
         free(ctx->v_infos);
+        ctx->v_infos = NULL;
     }
 
     if(ctx->pipe) {
@@ -1296,10 +1323,9 @@ static void close_device(v4l2_context_t *ctx)
         pthread_join(camera_control, NULL);
     }
 
-    if(ctx->vop == 1) {
-#ifdef V4L2_BUILD_DAEMO
-        deinit_render(ctx);
-#endif
+    if(ctx->hdmirx) {
+        hdmirx_thd = 0;
+        pthread_join(hdmi_detect, NULL);
     }
 
     if (ctx->writeFile) {
@@ -1321,11 +1347,11 @@ static void close_device(v4l2_context_t *ctx)
 static void open_device(v4l2_context_t *ctx)
 {
     DBG("-------- open output dev_name:%s -------------\n", ctx->dev_name);
-    ctx->fd = open(ctx->dev_name, O_RDWR | O_CLOEXEC /* required */ /*| O_NONBLOCK*/, 0);
+    ctx->fd = open(ctx->dev_name, O_RDWR | O_CLOEXEC | O_NONBLOCK, 0);
     if (-1 == ctx->fd)
         errno_exit(ctx, "erro open v4l2dev\n");
 
-    if (ctx->memtype){
+    if (ctx->memtype) {
         ctx->drm_fd = drm_open();
         if (ctx->drm_fd == -1)
             errno_exit(ctx, "drm open failed");
@@ -1338,50 +1364,47 @@ static void open_device(v4l2_context_t *ctx)
         }
     }
 
-    if(ctx->vop == 1){
-#ifdef V4L2_BUILD_DAEMO
-        init_render(ctx);
-#endif
-    }
-
-    if(ctx->pipe){
+    if(ctx->pipe) {
         mkfifo(p_fifo, 0666);
         pthread_create(&camera_control, NULL, &camera_thread, ctx);
+    }
+
+    if(ctx->hdmirx) {
+        hdmirx_thd = 1;
+        pthread_create(&hdmi_detect, NULL, &hdmirx_thread, ctx);
     }
 
     v4l2_enum_fmt(ctx);
     v4l2_enum_ctrls(ctx);
 
+    ctx->stride_x = ctx->width;
     ctx->stride_y = (ctx->height+15)&~15;
-    switch(ctx->format) {
-    default:
-        ERR("fix me!! using nv12 stride by default \n");
-    case V4L2_PIX_FMT_NV12:
-    case V4L2_PIX_FMT_NV21:
-    case V4L2_PIX_FMT_NV16:
-    case V4L2_PIX_FMT_NV61:
-        ctx->stride_x = ctx->width;
-        break;
-    case V4L2_PIX_FMT_YUYV:
-    case V4L2_PIX_FMT_YVYU:
-    case V4L2_PIX_FMT_UYVY:
-    case V4L2_PIX_FMT_VYUY:
-        // fix me!! actually 2*width
-        ctx->stride_x = ctx->width;
-        break;
-    }
-    ctx->log_interval = ctx->log_interval==0?1:30*ctx->log_interval;
+    frame_nums = ctx->frame_count;
+    log_rate = ctx->log_interval==0?1:30*ctx->log_interval;
+
     DBG("frame log_interval every %d frames \n",ctx->log_interval);
 }
 
 void v4l2_deinit(v4l2_context_t *ctx)
 {
+    if(ctx->vop == 1) {
+#ifdef V4L2_BUILD_DAEMO
+        deinit_render(ctx);
+#endif
+    }
+
     stop_capturing(ctx);
     deinit_device(ctx);
 }
 
 void v4l2_routine(v4l2_context_t *ctx)
 {
+    if(ctx->vop == 1) {
+#ifdef V4L2_BUILD_DAEMO
+        init_render(ctx);
+#endif
+    }
+
     init_device(ctx);
     start_capturing(ctx);
 }
@@ -1455,15 +1478,67 @@ rtn:
     pthread_exit(NULL);
 }
 
+void *hdmirx_thread(void *arg)
+{
+    v4l2_context_t *ctx = (v4l2_context_t *)arg;
+    struct v4l2_event_subscription sub;
+    struct v4l2_event event;
+    int ret = 0;
+
+    CLEAR(sub);
+    sub.type = HDMIRX_RESOLUTION_CHANGE;
+    ret = xioctl(ctx->fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
+    if (ret < 0)
+        ERR("subscribe hdmirx resolution change event failed");
+    CLEAR(sub);
+    sub.type = HDMIRX_HOTPLUG_EVENT;
+    ret = xioctl(ctx->fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
+    if (ret < 0)
+        ERR("subscribe hdmirx hotplug event failed");
+
+    while (hdmirx_thd) {
+        ret = xioctl(ctx->fd, VIDIOC_DQEVENT, &event);
+        if (ret == 0 && event.type == HDMIRX_HOTPLUG_EVENT) {
+            DBG("%s->--------hdmi plug out--------\n",__FUNCTION__);
+            frame_nums = 0;
+            hdmirx_hotplug = 1;
+#if !defined(V4L2_BUILD_DAEMO)
+            ctx->hdmi_event->onHotplug(hdmirx_hotplug);
+#endif
+        } else if (ret == 0 && event.type == HDMIRX_RESOLUTION_CHANGE) {
+            DBG("%s->--------hdmi plug in--------\n",__FUNCTION__);
+            hdmirx_hotplug = 2;
+#if !defined(V4L2_BUILD_DAEMO)
+            ctx->hdmi_event->onHotplug(hdmirx_hotplug);
+#endif
+            hdmirx_thd = 0;
+        }
+        usleep(200*1000);
+    }
+
+    CLEAR(sub);
+    sub.type = HDMIRX_RESOLUTION_CHANGE;
+    ret = xioctl(ctx->fd, VIDIOC_UNSUBSCRIBE_EVENT, &sub);
+    if (ret < 0)
+        ERR("unsubscribe hdmirx resolution change event failed");
+    CLEAR(sub);
+    sub.type = HDMIRX_HOTPLUG_EVENT;
+    ret = xioctl(ctx->fd, VIDIOC_UNSUBSCRIBE_EVENT, &sub);
+    if (ret < 0)
+        ERR("unsubscribe hdmirx resolution change event failed");
+    pthread_exit(NULL);
+}
+
 #ifdef V4L2_BUILD_DAEMO
 static void init_render(v4l2_context_t *ctx)
 {
+    int64_t renderptr;
+    v4l2_videoRenderer = std::shared_ptr<VideoRendererManager>(std::make_shared<VideoRendererManager>());
     byteview::VideoRenderConfig c = byteview::VideoRenderConfig(byteview::VideoRenderType::tEGL);
     c.setMediaDemo(true);
     c.setZindex(1);
-
-    std::shared_ptr<byteview::VideoRenderer> videoRender = byteview::VideoRenderer::create(c);
-    v4l2_videoRenderer = videoRender;
+    renderptr = v4l2_videoRenderer->create(c);
+    v4l2_videoRenderer ->setupViewPorts(renderptr, "bd_vi", 0, 100, 960, 540, 1, 0);
 
     if (ctx->format == V4L2_PIX_FMT_NV12)
         frmtype = byteview::FrameType::kNv12_OESFD;
@@ -1473,6 +1548,10 @@ static void init_render(v4l2_context_t *ctx)
         frmtype = byteview::FrameType::kNv16_OESFD;
     else if (ctx->format == V4L2_PIX_FMT_YUYV)
         frmtype = byteview::FrameType::kYUYV_OESFD;
+    else if (ctx->format == V4L2_PIX_FMT_NV24)
+        frmtype = byteview::FrameType::kNV24_OESFD;
+    else if (ctx->format == V4L2_PIX_FMT_BGR24)
+        frmtype = byteview::FrameType::kBGR24_OESFD;
     else
         DBG("unsupported format,render default using nv12 \n");
 
@@ -1493,30 +1572,31 @@ static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
         int this_option_optind = optind ? optind : 1;
         int option_index = 0;
         static struct option long_options[] = {
-            {"width",    required_argument, 0, 'w' },
-            {"height",   required_argument, 0, 'h' },
-            {"format",   required_argument, 0, 'f' },
-            {"srcfps",   required_argument, 0, 'i' },
-            {"dstfps",   required_argument, 0, 't' },
-            {"device",   required_argument, 0, 'd' },
-            {"memtype",  required_argument, 0, 'm' },
+            {"width",         required_argument, 0, 'w' },
+            {"height",        required_argument, 0, 'h' },
+            {"format",        required_argument, 0, 'f' },
+            {"srcfps",        required_argument, 0, 'i' },
+            {"dstfps",        required_argument, 0, 't' },
+            {"device",        required_argument, 0, 'd' },
+            {"memtype",       required_argument, 0, 'm' },
             {"stream-to",     required_argument, 0, 'o' },
             {"stream-count",  required_argument, 0, 'n' },
             {"stream-skip",   required_argument, 0, 'k' },
             {"hdr",           required_argument, 0, 'a' },
             {"count",         required_argument, 0, 'c' },
             {"log-interval",  required_argument, 0, 'g' },
-            {"sync-to-raw",   no_argument,  0, 'e' },
-            {"vop",      no_argument      , 0, 'v' },
-            {"silent",   no_argument,       0, 's' },
-            {"limit",    no_argument,       0, 'l' },
-            {"pipe",     no_argument,       0, 'y' },
-            {"help",     no_argument,       0, 'p' },
-            {0,          0,                 0,  0  }
+            {"sync-to-raw",   no_argument,       0, 'e' },
+            {"vop",           no_argument      , 0, 'v' },
+            {"silent",        no_argument,       0, 's' },
+            {"limit",         no_argument,       0, 'l' },
+            {"pipe",          no_argument,       0, 'y' },
+            {"hotplug",       no_argument,       0, 'p' },
+            {"help",          no_argument,       0, 'u' },
+            {0,               0,                 0,  0  }
         };
 
         //c = getopt_long(argc, argv, "w:h:f:i:d:o:c:ps",
-        c = getopt_long(argc, argv, "w:h:f:i:t:m:vd:o:n:k:c:a:psely",
+        c = getopt_long(argc, argv, "w:h:f:i:t:m:vd:o:n:k:c:a:pusely",
                         long_options, &option_index);
         if (c == -1)
             break;
@@ -1547,6 +1627,9 @@ static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
             break;
         case 'v':
             ctx->vop = 1;
+            break;
+        case 'p':
+            ctx->hdmirx = 1;
             break;
         case 'y':
             ctx->pipe = 1;
@@ -1579,7 +1662,7 @@ static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
         default:
             ERR("?? getopt returned character code 0%o ??\n", c);
         case '?':
-        case 'p':
+        case 'u':
             goto usage;
         }
     }
@@ -1592,16 +1675,17 @@ static void parse_args(int argc, char **argv, v4l2_context_t *ctx)
     return ;
 usage:
     ERR("Usage: %s to capture frames\n"
+        "         --device,                          required, path of video device\n"
         "         --width,  default 640,             optional, width of image\n"
         "         --height, default 360,             optional, height of image\n"
         "         --srcfps, default 30,              optional, source fps of camera\n"
         "         --dstfps, default 30,              optional, output fps of camera\n"
         "         --format, default NV12,            optional, fourcc of format\n"
         "         --count,  default -1,              optional, how many frames to capture, default unlimited\n"
-        "         --device,                          required, path of video device\n"
         "         --memtype,                         optional, 0:v4l2 fd, 1:drm fd, default 0\n"
         "         --vop,                             optional, frame render out\n"
         "         --pipe,                            optional, create fifo pipe thread for rpc\n"
+        "         --hotplug,                         optional, where current video source are hdmirx\n"
         "         --stream-to,                       optional, output file path, if <file> is '-', then the data is written to stdout\n"
         "         --stream-count, default 60         optional, how many frames to write files\n"
         "         --stream-skip, default 30          optional, how many frames to skip befor writing file\n"
@@ -1630,6 +1714,25 @@ static void signal_handle(int signo)
     exit(0);
 }
 
+static void mainloop(v4l2_context_t *ctx)
+{
+    int num_fds = 1;
+    struct pollfd pollFds[num_fds];
+    int ret = 0;
+
+    memset(pollFds, 0, sizeof(pollFds));
+    pollFds[0].fd = ctx->fd;
+    pollFds[0].events = (POLLPRI | POLLIN | POLLERR | POLLNVAL | POLLHUP);
+    while ((frame_nums == -1) || (frame_nums-- > 0)) {
+         ret = poll(pollFds, num_fds, 30);
+         if (ret > 0 && (pollFds[0].revents & (POLLERR | POLLNVAL | POLLHUP))) {
+             BYTE_LOGE("fd:%d polled error", ctx->fd);
+         } else {
+            v4l2_read_frame(ctx);
+         }
+    }
+}
+
 int main(int argc, char **argv)
 {
     sigset_t mask;
@@ -1654,7 +1757,6 @@ int main(int argc, char **argv)
     sigaction (SIGTERM, NULL, &old_action);
     if (old_action.sa_handler != SIG_IGN)
         sigaction (SIGTERM, &new_action, NULL);
-
     v4l2_context_t main_ctx = {
         .out_file = {'\0'},
         .dev_name = {'\0'},
@@ -1679,6 +1781,7 @@ int main(int argc, char **argv)
         .skipCnt = 30,
         .nv_infos = 0,
         .pipe = 0,
+        .hdmirx = 0,
         .yuv_dir_path = {'\0'},
         ._is_yuv_dir_exist = 0,
         .capture_yuv_num = 0,
@@ -1686,7 +1789,6 @@ int main(int argc, char **argv)
         .log_interval = 0,
     };
     parse_args(argc, argv, &main_ctx);
-
     /* start up rkaiq service */
     __system_property_set("bytedlark.rkaiq.on", "1");
     while(i++ < 10) {
@@ -1706,17 +1808,27 @@ int main(int argc, char **argv)
         ERR("%s->[error] waiting for rkisp service timeout!"
           "video capture maybe unnormal!",__FUNCTION__);
     __system_property_set("bytedlark.rkaiq.running","0");
+    pthread_sigmask(SIG_UNBLOCK, &mask, NULL);
 
+hotplug:
     open_device(&main_ctx);
     if(v4l2_check_fmt(&main_ctx) < 0)
         goto rtn;
     v4l2_routine(&main_ctx);
     g_main_ctx = &main_ctx;
-    pthread_sigmask(SIG_UNBLOCK, &mask, NULL);
     mainloop(&main_ctx);
     v4l2_deinit(&main_ctx);
+    while(hdmirx_hotplug == 1) {
+        DBG("waiting for hdmir plug in \n");
+        usleep(1*1000*1000);
+    }
 rtn:
     close_device(&main_ctx);
+    if(hdmirx_hotplug == 2) {
+        hdmirx_hotplug = 0;
+        ERR("hdmirx_hotplug in again, restart \n");
+        goto hotplug;
+    }
 
     return 0;
 }
